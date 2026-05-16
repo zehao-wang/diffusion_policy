@@ -1,0 +1,28 @@
+# Patch on top of the repo's conda env (`robodiff` from conda_environment.yaml).
+# These overrides are needed so the spatial_pusht/ training scripts can log to
+# wandb with the new v1-format API tokens (`wandb_v1_...`).
+#
+# Apply (inside the robodiff env):
+#   pip install -r exps/exp_pusht_real/requirements_patch.txt
+#   pip install --no-deps -U 'protobuf>=4.21,<8,!=5.28.0,!=5.29.0'
+#
+# The second line is needed because `robomimic==0.2.0` has a stale upper bound
+# `protobuf<=3.20.1` in its setup.py. robomimic 0.2.0's source code never
+# imports protobuf, so overriding it with --no-deps is safe.
+
+# wandb 0.13.3 (repo default) only accepts legacy 40-char API keys.
+# 0.26.x accepts both legacy and v1 tokens.
+wandb==0.26.1
+
+# tensorboard 2.10.1 ships _pb2.py compiled against protobuf 3.x and breaks on
+# protobuf 4+. 2.20 is built against the newer protobuf C++ descriptor API.
+# torch.utils.tensorboard is pulled in transitively by diffusers→accelerate.
+tensorboard==2.20.0
+
+# diffusers 0.11.1 (repo-pinned) still imports `cached_download` from
+# huggingface_hub, which was removed in 0.26. Pin to the last release that
+# still exposes it.
+huggingface_hub==0.25.2
+
+# Newer wandb traces use pandas; the base env doesn't ship it.
+pandas==1.5.3

@@ -1,0 +1,31 @@
+name: spatial_pusht_image
+
+grid_shape: &grid_shape [1, 128, 128]
+agent_pos_shape: &agent_pos_shape [2]
+action_shape: &action_shape [2]
+zarr_path: exps/exp_pusht_real/spatial_pusht/data/spatial_pusht.zarr
+
+shape_meta: &shape_meta
+  obs:
+    image:           # 1-channel binary occupancy of the T-block
+      shape: *grid_shape
+      type: rgb
+    agent_pos:       # current pusher voxel coords (robot state)
+      shape: *agent_pos_shape
+      type: low_dim
+  action:
+    shape: *action_shape
+
+# No simulator for real-robot data; rollout is a no-op.
+env_runner:
+  _target_: diffusion_policy.env_runner.real_pusht_image_runner.RealPushTImageRunner
+
+dataset:
+  _target_: exps.exp_pusht_real.spatial_pusht.data.occupancy_dataset.SpatialPushTOccupancyImageDataset
+  zarr_path: ${task.zarr_path}
+  horizon: ${horizon}
+  pad_before: ${eval:'${n_obs_steps}-1+${n_latency_steps}'}
+  pad_after: ${eval:'${n_action_steps}-1'}
+  seed: 42
+  val_ratio: 0.05
+  max_train_episodes: null
