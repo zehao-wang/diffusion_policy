@@ -20,6 +20,7 @@ if str(REPO_ROOT) not in sys.path:
 import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
+from matplotlib.colors import ListedColormap, BoundaryNorm
 import numpy as np
 import torch
 
@@ -27,12 +28,24 @@ from exps.exp_pusht_real.spatial_pusht.data import (
     SpatialPushTOccupancyFlatDataset,
     SpatialPushTOccupancyImageDataset,
 )
+from exps.exp_pusht_real.spatial_pusht.data.occupancy_utils import (
+    GOAL_VALUE, TBLOCK_VALUE,
+)
 
 
 # Coord convention (from episode_viewer.py:245-246):
 #   data stores [x, y] = [row, col]; image axis 0 (vertical) is x, axis 1 is y.
 def _agent_xy(agent_pos):
     return float(agent_pos[1]), float(agent_pos[0])  # plt expects (col, row)
+
+
+# Tri-valued colormap: background = white, goal = light green, T-block = dark red.
+# Boundaries chosen to bucket exact stored values (0.0, GOAL_VALUE, TBLOCK_VALUE).
+_OCC_CMAP = ListedColormap(["#ffffff", "#9bd49b", "#b21f1f"])
+_OCC_NORM = BoundaryNorm(
+    [-0.5, 0.25, (GOAL_VALUE + TBLOCK_VALUE) / 2.0, 1.5],
+    _OCC_CMAP.N,
+)
 
 
 def _render_sample(occ_thw, agent_pos_t, action_t, n_obs_steps, sample_idx, out_path):
@@ -47,7 +60,7 @@ def _render_sample(occ_thw, agent_pos_t, action_t, n_obs_steps, sample_idx, out_
 
     for t in range(T):
         ax = axes[t // cols][t % cols]
-        ax.imshow(occ_thw[t], cmap="Greys", origin="upper", vmin=0, vmax=1,
+        ax.imshow(occ_thw[t], cmap=_OCC_CMAP, norm=_OCC_NORM, origin="upper",
                   interpolation="nearest", zorder=0)
         # trajectory layer (drawn first; partially transparent so markers pop)
         ax.plot(traj_cols, traj_rows, color="red", linewidth=1.1, alpha=0.45,
@@ -69,8 +82,10 @@ def _render_sample(occ_thw, agent_pos_t, action_t, n_obs_steps, sample_idx, out_
         axes[t // cols][t % cols].axis("off")
 
     fig.suptitle(
-        f"sample #{sample_idx}  blue=pusher  red*=action_t  red·line=action chunk",
-        fontsize=13,
+        f"sample #{sample_idx}  "
+        f"green=goal({GOAL_VALUE})  dark-red=T-block({TBLOCK_VALUE})  "
+        f"blue=pusher  red*=action_t  red·line=action chunk",
+        fontsize=12,
     )
     fig.tight_layout(rect=[0, 0, 1, 0.96])
     fig.savefig(out_path, dpi=200)
@@ -78,26 +93,40 @@ def _render_sample(occ_thw, agent_pos_t, action_t, n_obs_steps, sample_idx, out_
 
 
 def _dump_text(sample_idx, agent_pos_t, action_t, occ_thw, out_path):
-    occ_sums = occ_thw.reshape(occ_thw.shape[0], -1).sum(axis=1).astype(int)
+    # Break down cell counts per (background / goal / T-block) so we can sanity
+    # check that BOTH layers survived the dataset pipeline.
+    flat = occ_thw.reshape(occ_thw.shape[0], -1)
+    goal_cnt = np.isclose(flat, GOAL_VALUE).sum(axis=1).astype(int)
+    tblk_cnt = np.isclose(flat, TBLOCK_VALUE).sum(axis=1).astype(int)
+    uniq_per_t = [np.unique(flat[t]).round(3).tolist() for t in range(flat.shape[0])]
     with out_path.open("w") as f:
         f.write(f"sample #{sample_idx}\n")
         f.write(f"horizon T = {occ_thw.shape[0]}, grid = {occ_thw.shape[1]}x{occ_thw.shape[2]}\n")
-        f.write("\nt | agent_pos [x,y] | action_target [x,y] | occupancy non-zero cells\n")
-        f.write("-" * 70 + "\n")
+        f.write(f"goal value = {GOAL_VALUE}  t-block value = {TBLOCK_VALUE}\n")
+        f.write("\n t | agent_pos [x,y] | action_target [x,y] | n_goal | n_tblk | unique vals\n")
+        f.write("-" * 90 + "\n")
         for t in range(occ_thw.shape[0]):
             ax_, ay_ = agent_pos_t[t]
             tx_, ty_ = action_t[t]
-            f.write(f"{t:2d} | [{ax_:6.2f},{ay_:6.2f}] | [{tx_:6.2f},{ty_:6.2f}] | {occ_sums[t]:4d}\n")
+            f.write(f"{t:2d} | [{ax_:6.2f},{ay_:6.2f}] | [{tx_:6.2f},{ty_:6.2f}] "
+                    f"| {goal_cnt[t]:5d} | {tblk_cnt[t]:5d} | {uniq_per_t[t]}\n")
 
 
 def _occ_from_batch(name, sample):
-    """Return (T, H, W) float occupancy from whichever variant's obs dict."""
-    if "image" in sample["obs"]:
-        occ = sample["obs"]["image"].numpy()  # (T, 1, H, W)
-        return occ[:, 0]
-    flat = sample["obs"]["occupancy_flat"].numpy()  # (T, H*W)
-    side = int(round(flat.shape[-1] ** 0.5))
-    return flat.reshape(flat.shape[0], side, side)
+    """Return (T, H, W) float occupancy and (T, 2) agent_pos for a sample.
+
+    Variant A returns obs as a dict {image, agent_pos}; variant B returns obs
+    as a single concatenated tensor [occupancy.flatten() || agent_pos].
+    """
+    obs = sample["obs"]
+    if isinstance(obs, dict):
+        occ = obs["image"].numpy()              # (T, 1, H, W)
+        return occ[:, 0], obs["agent_pos"].numpy()
+    flat = obs.numpy()                          # (T, H*W + 2)
+    agent = flat[:, -2:]
+    side = int(round((flat.shape[-1] - 2) ** 0.5))
+    occ = flat[:, :-2].reshape(flat.shape[0], side, side)
+    return occ, agent
 
 
 def parse_args():
@@ -139,8 +168,7 @@ def main():
         print(f"  variant {tag}: dataset len={len(ds)}, picking {len(idxs)} samples")
         for i, idx in enumerate(idxs):
             sample = ds[int(idx)]
-            occ = _occ_from_batch(tag, sample)
-            agent = sample["obs"]["agent_pos"].numpy()
+            occ, agent = _occ_from_batch(tag, sample)
             action = sample["action"].numpy()
             _render_sample(occ, agent, action, args.n_obs_steps, int(idx),
                            variant_dir / f"sample_{i:02d}_idx{int(idx)}.png")

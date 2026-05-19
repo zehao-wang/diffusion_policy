@@ -1,13 +1,13 @@
 defaults:
   - _self_
-  - task: spatial_pusht_image
+  - task: pusht_real_rgb
 
-name: train_spatial_pusht_occupancy_image
+name: train_pusht_real_rgb
 _target_: diffusion_policy.workspace.train_diffusion_unet_hybrid_workspace.TrainDiffusionUnetHybridWorkspace
 
 task_name: ${task.name}
 shape_meta: ${task.shape_meta}
-exp_name: occupancy_image
+exp_name: rgb_image
 
 horizon: 16
 n_obs_steps: 2
@@ -38,15 +38,14 @@ policy:
   n_obs_steps: ${n_obs_steps}
   num_inference_steps: 100
   obs_as_global_cond: ${obs_as_global_cond}
-  # 128x128 binary occupancy; disable random crop (would clip the T).
-  crop_shape: null
+  crop_shape: [76, 76]
   diffusion_step_embed_dim: 128
   down_dims: [512, 1024, 2048]
   kernel_size: 5
   n_groups: 8
   cond_predict_scale: True
   obs_encoder_group_norm: True
-  eval_fixed_crop: False
+  eval_fixed_crop: True
 
 ema:
   _target_: diffusion_policy.model.diffusion.ema_model.EMAModel
@@ -78,7 +77,7 @@ optimizer:
   weight_decay: 1.0e-6
 
 training:
-  device: "cuda:1"
+  device: "cuda:0"
   seed: 42
   debug: False
   resume: True

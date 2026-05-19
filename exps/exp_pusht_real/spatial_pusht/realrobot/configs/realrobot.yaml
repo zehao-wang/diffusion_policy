@@ -1,0 +1,89 @@
+# Real-robot inference config for spatial_pusht_image coordinator.
+#
+# The trained checkpoint is no longer loaded here; it runs behind the
+# HTTP service in policy_service/ (start it independently). See
+# policy_service/README.md.
+#
+# All paths are relative to the diffusion_policy repo root
+# (.../packages/diffusion_policy), matching how train.py / eval.py are run.
+
+# AprilTag-world voxel grid (== spatial_episode_v1.spatial_config in JSON)
+bbox_min: [-0.05, -0.10, 0.0]
+bbox_max: [ 0.45,  0.45, 0.1]
+resolution_xyz: [128, 128, 12]
+# z slice the 2D model commits to when decoding voxel actions back to 3D.
+# Episode JSONs use `move.target_coord[2] = 3`.
+action_z_voxel: 3
+
+paths:
+  # Static AprilTag reconstruction model dir. Contains
+  #   * reference_aligned_to_model_filtered.json
+  #   * tblock.ply
+  # Both shipped in commit db676a8 of robodata_Agilex@minye.
+  model_dir: data/realrobot/model
+
+  # World <-> base transform. We accept either schema:
+  #   * minye's `arm_world_from_apriltag_points_v1` (joint solve, includes tip)
+  #   * the 4-corner `world_config.json` (only rotation+translation)
+  # `arm_world_calibration.json` is preferred -- its world frame IS the
+  # AprilTag world, so no extra alignment step is needed.
+  world_transform: data/realrobot/records/arm_world_calibration.json
+
+  # Optional: override the tip-in-EEF offset. If absent, we use the field
+  # baked into arm_world_calibration.json above.
+  tip_in_eef_override: null
+
+  # PointGrey intrinsics from minye's checkerboard calibration (2448x2048).
+  pointgrey_calibration: data/realrobot/pointgrey_calibration.json
+
+  # Any recorded spatial_episode_v1 JSON; the static goal_coords layer is
+  # pulled from its first available frame and rasterized into the same
+  # tri-valued occupancy grid (0=bg, 0.5=goal, 1.0=T) used at training time.
+  # Must come from the same workspace calibration as the trained checkpoint.
+  goal_source_json: data/spatial_episode_2026051/spatial_episode_20260513_181635_580.json
+
+camera:
+  # MUST match the resolution in pointgrey_calibration.json (the calibration
+  # client refuses to merge if they differ). minye's file is the native
+  # Blackfly S BFS-U3-51S5M sensor size.
+  width: 2448
+  height: 2048
+  fps: 30
+  socket_path: /tmp/pointgrey_capture.sock
+  shm_prefix: pointgrey_capture
+  # Run the capture service yourself with sudo in a separate terminal.
+  auto_start: false
+  service_python: /home/zwa0839/miniconda3/envs/pusht_service/bin/python
+  device_serial: "16276900"   # Blackfly S BFS-U3-51S5M from minye's calibration; null = any
+
+apriltag:
+  family: tag36h11
+  nthreads: 2
+  quad_decimate: 1.0
+  quad_sigma: 1.0
+  refine_edges: true
+  decode_sharpening: 0.25
+  enable_kalman: true
+
+pusht_service:
+  url: http://localhost:8012
+  channel: can0
+  interface: socketcan
+  speed: 20 # 5
+  # Bumped from 3 -> 6: /robot/step_chunk streams every planned config without
+  # stopping between waypoints, so denser per-segment sampling now translates
+  # directly into smoother motion across segment seams.
+  timesteps: 6 # 15
+  dt: 0.05
+  poll_hz: 30.0   # background ArmReader polling rate
+
+policy_service:
+  url: http://localhost:8014
+  request_timeout_s: 30.0
+
+loop:
+  rate_hz: 10
+  # No outer reproj gate — apriltag.enable_kalman lets the smoother
+  # drop bad measurements internally (matches minye/utils/apriltag_reconstruction
+  # `max_reproj_error_px_for_update`).
+  max_steps: -1

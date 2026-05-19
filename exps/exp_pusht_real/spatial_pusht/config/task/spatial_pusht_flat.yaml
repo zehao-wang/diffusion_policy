@@ -1,23 +1,14 @@
 name: spatial_pusht_flat
 
-occupancy_flat_shape: &occupancy_flat_shape [16384]   # 128 * 128
-agent_pos_shape: &agent_pos_shape [2]
-action_shape: &action_shape [2]
+# obs = [occupancy.flatten() (128*128) || agent_pos (2)]
+# mirrors pusht_lowdim's "obs_dim = n_kp*keypoint_dim + agent_pos_dim" pattern.
+obs_dim: 16386          # 128*128 + 2
+action_dim: 2
+keypoint_dim: 16384     # the occupancy slice (kept for the workspace's eval template)
 zarr_path: exps/exp_pusht_real/spatial_pusht/data/spatial_pusht.zarr
 
-shape_meta: &shape_meta
-  obs:
-    occupancy_flat:  # flattened 128*128 binary occupancy
-      shape: *occupancy_flat_shape
-      type: low_dim
-    agent_pos:       # current pusher voxel coords (robot state)
-      shape: *agent_pos_shape
-      type: low_dim
-  action:
-    shape: *action_shape
-
 env_runner:
-  _target_: diffusion_policy.env_runner.real_pusht_image_runner.RealPushTImageRunner
+  _target_: exps.exp_pusht_real.spatial_pusht.data.noop_runner.RealPushTLowdimRunner
 
 dataset:
   _target_: exps.exp_pusht_real.spatial_pusht.data.occupancy_dataset.SpatialPushTOccupancyFlatDataset
@@ -28,3 +19,5 @@ dataset:
   seed: 42
   val_ratio: 0.05
   max_train_episodes: null
+  occupancy_pool: 1
+  stride: 1

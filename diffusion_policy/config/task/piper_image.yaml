@@ -1,0 +1,40 @@
+name: piper_image
+
+# Target decode/store resolution (H x W).
+# Source videos are 720x1280; we decode at this size to save RAM.
+# The obs_encoder then crops to crop_shape (90%).
+image_shape: [3, 240, 320]
+
+# Path to lerobot dataset root (contains meta/, data/, videos/).
+dataset_path: /mnt/disk2/zehao_lerobot_dset/piper-record
+
+shape_meta: &shape_meta
+  obs:
+    realsense:
+      shape: ${task.image_shape}
+      type: rgb
+    zed2i:
+      shape: ${task.image_shape}
+      type: rgb
+    robot_state:
+      shape: [7]
+      type: low_dim
+  action:
+    shape: [7]
+
+dataset:
+  _target_: diffusion_policy.dataset.lerobot_image_dataset.LeRobotImageDataset
+  shape_meta: *shape_meta
+  dataset_path: ${task.dataset_path}
+  horizon: ${horizon}
+  pad_before: ${eval:'${n_obs_steps}-1+${n_latency_steps}'}
+  pad_after: ${eval:'${n_action_steps}-1'}
+  n_obs_steps: ${dataset_obs_steps}
+  use_cache: True
+  seed: 42
+  val_ratio: 0.0
+  max_train_episodes: null
+
+# No sim env runner for real robot
+env_runner:
+  _target_: diffusion_policy.env_runner.real_pusht_image_runner.RealPushTImageRunner

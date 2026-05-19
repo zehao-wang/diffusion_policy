@@ -29,3 +29,4 @@ dataset:
   seed: 42
   val_ratio: 0.05
   max_train_episodes: null
+  stride: 1

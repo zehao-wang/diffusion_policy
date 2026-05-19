@@ -2,10 +2,19 @@
 
 Two variants of "occupancy-as-state" diffusion policy trained on the real-robot
 PushT recordings under `data/spatial_episode_*/`. RGB frames are **not** used —
-the only environment observation is the 2-D binary occupancy of the T-block on
-the discretized workspace (default 128×128). `agent_pos` (the pusher's current
-voxel coords) is fed as a separate "robot state" input, and the policy outputs
-an action chunk of length `horizon`.
+the only environment observation is a 2-D **tri-valued** occupancy grid on
+the discretized workspace (default 128×128) encoding both the goal mask and the
+T-block:
+
+```
+background = 0.0
+goal cell  = 0.5
+T-block    = 1.0   (drawn last; overwrites goal on overlap so the dynamic
+                    T geometry is never destroyed by the static goal)
+```
+
+`agent_pos` (the pusher's current voxel coords) is fed as a separate "robot
+state" input, and the policy outputs an action chunk of length `horizon`.
 
 ```
 obs (per timestep):
@@ -57,6 +66,10 @@ python -m exps.exp_pusht_real.spatial_pusht.scripts.build_replay_buffer \
 ```
 
 Flags:
+- `--action-source next_agent` is the default. The spatial logs are
+  post-action snapshots, so `action[t]` is reconstructed as the next pusher
+  voxel position, matching official PushT's `state_t + command_t` replay
+  semantics.
 - `--sparse` use `tblock_coords` (~80 cells) instead of the denser
   `tblock_coords_full` (~470 cells).
 - `--no_ffill` drop forward-filling on perception-failure frames.
@@ -108,8 +121,13 @@ downstream visualisation or env wrapper.
 
 ## What is NOT included
 
-- `goal` channel — the user's goal is fixed across all episodes, so it's not
-  fed to the model. If a multi-goal setup is ever needed, add a third
-  occupancy channel from `frame.spatial.goal_coords` (the JSON has it).
 - RGB video — the `.mp4` files are unused; this is a purely state-space policy.
 - A simulator env runner — real-robot only, so `env_runner` is a no-op.
+
+## Notes on goal encoding
+
+Goal is read per-frame from `spatial.goal_coords` (verified byte-identical
+across all 38 recorded episodes — 88 cells forming a T outline). It is
+rendered in the same single channel as the T-block, using value 0.5. T-block
+(1.0) is drawn after the goal so overlap preserves T geometry. The shape stays
+`[1, 128, 128]`; only the value semantics changed.

@@ -28,20 +28,23 @@ GROUP="spatial_pusht_${TS}"
 mkdir -p "$LOG_DIR"
 
 launch() {
-    local tag=$1 cfg=$2 gpu=$3
-    local log="$LOG_DIR/${tag}_${TS}.log"
-    conda run -n robodiff --no-capture-output python train.py \
+    # $1 cfg-name, $2 gpu index, $3 log path; remaining args go to train.py.
+    local cfg=$1 gpu=$2 log=$3
+    shift 3
+    exec conda run -n robodiff --no-capture-output python train.py \
         --config-dir="$CONFIG_DIR" --config-name="$cfg" \
         training.device="cuda:${gpu}" \
         logging.group="$GROUP" \
-        "$@" >"$log" 2>&1 &
-    echo "$! $log"
+        "$@" >"$log" 2>&1
 }
 
-shift_args=("${@:1}")
+IMAGE_LOG="$LOG_DIR/image_${TS}.log"
+FLAT_LOG="$LOG_DIR/flat_${TS}.log"
 
-read IMAGE_PID IMAGE_LOG < <(launch image train_spatial_pusht_image_workspace 0 "${shift_args[@]}")
-read FLAT_PID  FLAT_LOG  < <(launch flat  train_spatial_pusht_flat_workspace  1 "${shift_args[@]}")
+launch train_spatial_pusht_image_workspace 0 "$IMAGE_LOG" "$@" &
+IMAGE_PID=$!
+launch train_spatial_pusht_flat_workspace  1 "$FLAT_LOG"  "$@" &
+FLAT_PID=$!
 
 printf "image -> cuda:0  pid=%s  log=%s\n" "$IMAGE_PID" "$IMAGE_LOG"
 printf "flat  -> cuda:1  pid=%s  log=%s\n" "$FLAT_PID"  "$FLAT_LOG"

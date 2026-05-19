@@ -3,25 +3,37 @@ defaults:
   - task: spatial_pusht_flat
 
 name: train_spatial_pusht_occupancy_flat
-_target_: diffusion_policy.workspace.train_diffusion_unet_hybrid_workspace.TrainDiffusionUnetHybridWorkspace
+_target_: diffusion_policy.workspace.train_diffusion_unet_lowdim_workspace.TrainDiffusionUnetLowdimWorkspace
 
+obs_dim: ${task.obs_dim}
+action_dim: ${task.action_dim}
+keypoint_dim: ${task.keypoint_dim}
 task_name: ${task.name}
-shape_meta: ${task.shape_meta}
 exp_name: occupancy_flat
 
 horizon: 16
 n_obs_steps: 2
 n_action_steps: 8
 n_latency_steps: 0
-dataset_obs_steps: ${n_obs_steps}
 past_action_visible: False
 keypoint_visible_rate: 1.0
+obs_as_local_cond: False
 obs_as_global_cond: True
+pred_action_steps_only: False
 
 policy:
-  _target_: diffusion_policy.policy.diffusion_unet_hybrid_image_policy.DiffusionUnetHybridImagePolicy
+  _target_: diffusion_policy.policy.diffusion_unet_lowdim_policy.DiffusionUnetLowdimPolicy
 
-  shape_meta: ${shape_meta}
+  model:
+    _target_: diffusion_policy.model.diffusion.conditional_unet1d.ConditionalUnet1D
+    input_dim: "${eval: ${task.action_dim} if ${obs_as_local_cond} or ${obs_as_global_cond} else ${task.obs_dim} + ${task.action_dim}}"
+    local_cond_dim: "${eval: ${task.obs_dim} if ${obs_as_local_cond} else None}"
+    global_cond_dim: "${eval: ${task.obs_dim}*${n_obs_steps} if ${obs_as_global_cond} else None}"
+    diffusion_step_embed_dim: 256
+    down_dims: [256, 512, 1024]
+    kernel_size: 5
+    n_groups: 8
+    cond_predict_scale: True
 
   noise_scheduler:
     _target_: diffusers.schedulers.scheduling_ddpm.DDPMScheduler
@@ -34,19 +46,15 @@ policy:
     prediction_type: epsilon
 
   horizon: ${horizon}
+  obs_dim: ${obs_dim}
+  action_dim: ${action_dim}
   n_action_steps: ${eval:'${n_action_steps}+${n_latency_steps}'}
   n_obs_steps: ${n_obs_steps}
   num_inference_steps: 100
+  obs_as_local_cond: ${obs_as_local_cond}
   obs_as_global_cond: ${obs_as_global_cond}
-  # No rgb keys; crop is unused.
-  crop_shape: null
-  diffusion_step_embed_dim: 128
-  down_dims: [512, 1024, 2048]
-  kernel_size: 5
-  n_groups: 8
-  cond_predict_scale: True
-  obs_encoder_group_norm: True
-  eval_fixed_crop: False
+  pred_action_steps_only: ${pred_action_steps_only}
+  oa_step_convention: True
 
 ema:
   _target_: diffusion_policy.model.diffusion.ema_model.EMAModel

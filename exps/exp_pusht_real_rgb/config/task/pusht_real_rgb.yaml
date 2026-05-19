@@ -1,0 +1,27 @@
+name: pusht_real_rgb
+
+image_shape: &image_shape [3, 96, 96]
+shape_meta: &shape_meta
+  obs:
+    image:
+      shape: *image_shape
+      type: rgb
+    agent_pos:
+      shape: [2]
+      type: low_dim
+  action:
+    shape: [2]
+
+env_runner:
+  _target_: diffusion_policy.env_runner.real_pusht_image_runner.RealPushTImageRunner
+
+dataset:
+  _target_: exps.exp_pusht_real_rgb.data.strided_image_dataset.StridedPushTImageDataset
+  zarr_path: exps/exp_pusht_real_rgb/data/pusht_real_rgb.zarr
+  horizon: ${horizon}
+  pad_before: ${eval:'${n_obs_steps}-1'}
+  pad_after: ${eval:'${n_action_steps}-1'}
+  seed: 42
+  val_ratio: 0.05
+  max_train_episodes: null
+  stride: 1

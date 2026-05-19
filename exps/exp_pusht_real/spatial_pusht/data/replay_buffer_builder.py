@@ -3,7 +3,7 @@
 Stored data arrays per step:
     occupancy: (N, H, W) float32, T-block binary occupancy grid
     agent_pos: (N, 2)    float32, pusher voxel [x, y]
-    action:    (N, 2)    float32, target voxel  [x, y]
+    action:    (N, 2)    float32, command target voxel [x, y]
 Plus meta/episode_ends.
 """
 from pathlib import Path
@@ -24,6 +24,7 @@ def build_replay_buffer(
     grid_hw: Tuple[int, int] = (128, 128),
     use_full_occupancy: bool = True,
     forward_fill_unavailable: bool = True,
+    action_source: str = "next_agent",
     glob_pattern: str = "spatial_episode_*.json",
     episodes: Optional[Sequence[str]] = None,
 ) -> ReplayBuffer:
@@ -55,6 +56,7 @@ def build_replay_buffer(
             grid_hw=grid_hw,
             use_full_occupancy=use_full_occupancy,
             forward_fill_unavailable=forward_fill_unavailable,
+            action_source=action_source,
         )
         ep_data = {
             "occupancy": data["occupancy"],

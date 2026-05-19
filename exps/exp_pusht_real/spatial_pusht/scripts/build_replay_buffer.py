@@ -4,6 +4,9 @@ Usage (from repo root):
     python -m exps.exp_pusht_real.spatial_pusht.scripts.build_replay_buffer \
         --json_dir data/spatial_episode_2026051 \
         --output exps/exp_pusht_real/spatial_pusht/data/spatial_pusht.zarr
+
+By default action[t] is reconstructed from the next frame's pusher position,
+because the spatial_episode JSON frames are post-action snapshots.
 """
 import argparse
 import sys
@@ -25,6 +28,15 @@ def parse_args():
                    help="Use tblock_coords (sparse) instead of tblock_coords_full (dense).")
     p.add_argument("--no_ffill", action="store_true",
                    help="Do not forward-fill occupancy on frames with available=False.")
+    p.add_argument(
+        "--action-source",
+        choices=["current_target", "next_target", "next_agent"],
+        default="next_agent",
+        help=(
+            "How to construct action[t]. For post-action spatial logs, "
+            "next_agent matches official PushT's state_t + command_t semantics."
+        ),
+    )
     return p.parse_args()
 
 
@@ -36,6 +48,7 @@ def main():
         grid_hw=tuple(args.grid),
         use_full_occupancy=not args.sparse,
         forward_fill_unavailable=not args.no_ffill,
+        action_source=args.action_source,
     )
 
 
