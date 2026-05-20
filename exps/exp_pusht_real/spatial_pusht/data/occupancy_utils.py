@@ -26,7 +26,7 @@ TBLOCK_VALUE = 1.0
 
 def _paint(grid, coords, value):
     """In-place write `value` at the valid integer cells of `coords`."""
-    if not coords:
+    if coords is None or len(coords) == 0:
         return
     arr = np.asarray(coords, dtype=np.int64)
     if arr.ndim != 2 or arr.shape[1] < 2:
