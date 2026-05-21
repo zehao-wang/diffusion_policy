@@ -37,6 +37,26 @@ def parse_args():
             "next_agent matches official PushT's state_t + command_t semantics."
         ),
     )
+    p.add_argument(
+        "--tbar-coord-key",
+        choices=["tblock_coords", "tblock_coords_full"],
+        default="tblock_coords",
+        help=(
+            "Which JSON field feeds the per-frame T-bar voxel set written to "
+            "the `tblock_coords` zarr field (used by the lowdim-coords policy "
+            "variant). Independent of --sparse, which controls occupancy only."
+        ),
+    )
+    p.add_argument(
+        "--tbar-pad-n",
+        type=int,
+        default=None,
+        help=(
+            "Pad length K for the `tblock_coords` zarr field. Defaults to the "
+            "observed dataset-wide max voxel count. Longer frames are uniformly "
+            "sub-sampled to fit K; shorter frames are padded with sentinel -1."
+        ),
+    )
     return p.parse_args()
 
 
@@ -49,6 +69,8 @@ def main():
         use_full_occupancy=not args.sparse,
         forward_fill_unavailable=not args.no_ffill,
         action_source=args.action_source,
+        tbar_coord_key=args.tbar_coord_key,
+        tbar_pad_n=args.tbar_pad_n,
     )
 
 

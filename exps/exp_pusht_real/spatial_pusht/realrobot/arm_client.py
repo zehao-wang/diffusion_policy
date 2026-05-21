@@ -274,6 +274,41 @@ class RealRobotArmClient:
             payload["trim_intermediate_stops"] = bool(trim_intermediate_stops)
         return self._post("/robot/step_chunk", payload, timeout=timeout)
 
+    def replay_joint_trajectory(
+        self,
+        trajectory: "list[list[float]] | list[np.ndarray] | np.ndarray",
+        *,
+        speed: int = 5,
+        dt: float = 0.05,
+        final_tol: int = 100,
+        final_settle_s: float = 0.3,
+        final_timeout: float = 5.0,
+        timeout: float = 120.0,
+    ) -> dict:
+        """Stream a caller-supplied joint trajectory through the arm verbatim.
+
+        Bypasses the planner entirely -- the trajectory is streamed config-by-
+        config at the given dt. Intended for replaying (typically reversing) a
+        trajectory previously returned by ``send_targets_world`` so that
+        lift/reveal/return motions follow the exact same joint path in both
+        directions rather than re-planning each leg independently.
+        """
+        rows: list[list[float]] = []
+        for cfg in trajectory:
+            arr = np.asarray(cfg, dtype=np.float64).reshape(-1)
+            rows.append([float(v) for v in arr.tolist()])
+        if not rows:
+            return {"status": "empty", "num_configs": 0}
+        payload = {
+            "trajectory": rows,
+            "speed": int(speed),
+            "dt": float(dt),
+            "final_tol": int(final_tol),
+            "final_settle_s": float(final_settle_s),
+            "final_timeout": float(final_timeout),
+        }
+        return self._post("/robot/execute_trajectory", payload, timeout=timeout)
+
 
 def _wxyz_to_matrix(wxyz: np.ndarray) -> np.ndarray:
     from scipy.spatial.transform import Rotation

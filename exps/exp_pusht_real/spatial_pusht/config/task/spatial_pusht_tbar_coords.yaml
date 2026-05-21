@@ -1,0 +1,26 @@
+name: spatial_pusht_tbar_coords
+
+# obs = [tblock_coords.flatten() (K*2) || agent_pos (2)]
+# K is the dataset-wide observed max-voxel-count chosen at build time. The
+# default below matches `--tbar-coord-key tblock_coords` (sparse outline) on the
+# data/spatial_episode_2026051 dump (observed max = 101). Override at the CLI
+# (`task.tbar_pad_n=...`) if you rebuild with a different K.
+tbar_pad_n: 101
+obs_dim: ${eval:'${task.tbar_pad_n}*2 + 2'}
+action_dim: 2
+keypoint_dim: ${eval:'${task.tbar_pad_n}*2'}   # kept for workspace's eval template
+zarr_path: exps/exp_pusht_real/spatial_pusht/data/spatial_pusht.zarr
+
+env_runner:
+  _target_: exps.exp_pusht_real.spatial_pusht.data.noop_runner.RealPushTLowdimRunner
+
+dataset:
+  _target_: exps.exp_pusht_real.spatial_pusht.data.occupancy_dataset.SpatialPushTTBarCoordsDataset
+  zarr_path: ${task.zarr_path}
+  horizon: ${horizon}
+  pad_before: ${eval:'${n_obs_steps}-1+${n_latency_steps}'}
+  pad_after: ${eval:'${n_action_steps}-1'}
+  seed: 42
+  val_ratio: 0.05
+  max_train_episodes: null
+  stride: 1

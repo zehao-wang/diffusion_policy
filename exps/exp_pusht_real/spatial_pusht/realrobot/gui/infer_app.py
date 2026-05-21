@@ -12,11 +12,14 @@ button callbacks, and the main loop.
 
 from __future__ import annotations
 
+import datetime
 import threading
 import time
 from dataclasses import replace
+from pathlib import Path
 from typing import Optional
 
+import cv2
 import numpy as np
 import viser
 
@@ -28,6 +31,7 @@ from .scene import InferScene
 PREVIEW_CELL_PX = 16
 CAMERA_PREVIEW_MAX_W = 640
 CAMERA_PREVIEW_MAX_H = 540
+SAVE_ROOT = Path("data/realrobot/infer_runs")
 
 
 class InferViserApp:
@@ -56,6 +60,10 @@ class InferViserApp:
         self._sticky_action_voxels: Optional[list] = None
         self._sticky_action_text: Optional[str] = None
         self._last_execute_reason: str = "OFF: checkbox unchecked"
+
+        # Auto-run dump state — filled in by Start Auto, cleared by Stop.
+        self._save_dir: Optional[Path] = None
+        self._save_idx: int = 0
 
         self._build_sidebar()
         self._scene = InferScene(self.server, self.runner)
@@ -213,12 +221,23 @@ class InferViserApp:
         if not self.runner.arm_connected and self.runner.arm is not None:
             self._set_status(self._infer_status_md, "Inference", "start refused: arm not connected")
             return
+        stamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+        self._save_dir = SAVE_ROOT / stamp
+        self._save_dir.mkdir(parents=True, exist_ok=True)
+        self._save_idx = 0
+        print(f"[infer-viser] auto-run dump dir: {self._save_dir.resolve()}")
         self._auto_running.set()
         self._set_status(self._infer_status_md, "Inference", "auto running")
 
     def _on_stop_click(self, _event) -> None:
         self._auto_running.clear()
         self._step_once_remaining = 0
+        if self._save_dir is not None:
+            print(
+                f"[infer-viser] auto-run dump closed: wrote {self._save_idx} "
+                f"frames to {self._save_dir.resolve()}"
+            )
+            self._save_dir = None
         self._set_status(self._infer_status_md, "Inference", "stopped")
 
     def _on_step_once_click(self, _event) -> None:
@@ -282,6 +301,8 @@ class InferViserApp:
 
             self._latest_snap = snap
             self._render_snapshot(snap, ran_policy=run_policy)
+            if self._auto_running.is_set():
+                self._save_auto_frame(snap)
             _sleep_to(t0, target_dt)
 
     # ------------------------------------------------------------------
@@ -354,6 +375,43 @@ class InferViserApp:
                 self._infer_status_md, "Inference",
                 f"idle {exec_tag}",
             )
+
+    # ------------------------------------------------------------------
+    # Auto-run dump
+    # ------------------------------------------------------------------
+    def _save_auto_frame(self, snap: StepSnapshot) -> None:
+        """Persist [camera frame | occupancy overlay] for the current tick.
+
+        Occupancy is rendered with sticky-action injection so the saved
+        image matches what the GUI is showing (green = predicted waypoints,
+        red = current pusher voxel).
+        """
+        if self._save_dir is None or snap.color_preview is None:
+            return
+
+        display_snap = snap
+        if snap.action_voxels is None and self._sticky_action_voxels is not None:
+            display_snap = replace(snap, action_voxels=self._sticky_action_voxels)
+
+        frame = render.camera_frame(snap.color_preview, self._preview_size())
+        occ = render.occupancy_2d(
+            display_snap,
+            resolution_xyz=np.asarray(self.runner.cfg.resolution_xyz, dtype=np.int32),
+            cell_px=PREVIEW_CELL_PX,
+        )
+        fh = frame.shape[0]
+        oh, ow = occ.shape[:2]
+        if oh != fh:
+            new_ow = max(1, int(round(ow * fh / oh)))
+            occ = cv2.resize(occ, (new_ow, fh), interpolation=cv2.INTER_NEAREST)
+        combined = np.concatenate([frame, occ], axis=1)
+        out_path = self._save_dir / f"step_{self._save_idx:06d}.png"
+        try:
+            cv2.imwrite(str(out_path), cv2.cvtColor(combined, cv2.COLOR_RGB2BGR))
+        except Exception as exc:
+            print(f"[infer-viser] failed to save {out_path}: {exc}", flush=True)
+            return
+        self._save_idx += 1
 
     # ------------------------------------------------------------------
     # Entry point

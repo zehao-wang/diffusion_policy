@@ -28,11 +28,12 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable, Optional
 
+import cv2
 import numpy as np
 import yaml
 from omegaconf import OmegaConf
 
-from ..data.occupancy_utils import load_goal_grid_from_json
+from ..data.occupancy_utils import load_goal_grid_from_json, pad_tbar_coords_frame
 from .arm_client import RealRobotArmClient
 from .arm_reader import ArmReader
 from .perception.apriltag_reconstruction import camera_calibration_from_info
@@ -104,10 +105,45 @@ class InferLoopRunner:
 
         self.n_obs_steps = int(policy_status.n_obs_steps)
         self.n_action_steps = int(policy_status.n_action_steps)
-        # Image-kind ckpts (e.g. pusht_real_rgb) want the raw camera frame on the
-        # wire; the server preprocesses it to match the training transform. The
-        # lowdim/occupancy path still gets the perception-extracted grid.
-        self._send_raw_camera_frame = (policy_status.policy_kind == "image")
+        # Three policy flavors ride on this loop:
+        #   * "image" with image_shape[0]==3 (pusht_real_rgb): we mirror the
+        #     server's training-time transform client-side and ship the
+        #     (3, H, W) float32 tensor -- the raw 2448x2048 uint8 frame is
+        #     ~500x bigger once JSON-encoded and dominates /predict latency.
+        #   * "image" with image_shape[0]==1 OR "lowdim": send the
+        #     perception-extracted occupancy grid (obs.image) as-is.
+        #   * "tbar_coords": send a (T, K, 2) padded voxel coord set built
+        #     from obs.tblock_coords; no image on the wire.
+        # Two "coords"-style policies share the same wire shape (T, S, 2) but
+        # pull per-frame slot data from different perception fields.
+        kind = policy_status.policy_kind
+        if kind == "tbar_coords":
+            if policy_status.tbar_pad_n is None:
+                raise ValueError(
+                    "policy_kind=tbar_coords but status.tbar_pad_n is None")
+            self._coords_kind: Optional[str] = "tbar_coords"
+            self._coord_slot_count: Optional[int] = policy_status.tbar_pad_n
+        elif kind == "tag_keypoints":
+            if policy_status.n_tag_keypoints is None:
+                raise ValueError(
+                    "policy_kind=tag_keypoints but status.n_tag_keypoints is None")
+            self._coords_kind = "tag_keypoints"
+            self._coord_slot_count = policy_status.n_tag_keypoints
+        else:
+            self._coords_kind = None
+            self._coord_slot_count = None
+        self._preprocess_raw_camera = (
+            kind == "image"
+            and policy_status.image_shape is not None
+            and policy_status.image_shape[0] == 3
+        )
+        # `_obs_hist` stores dicts whose obs entry key matches the wire format
+        # the policy server expects. Constant per runner; fixed once here so
+        # the stack at predict time picks the right field every iteration.
+        self._wire_obs_key = "coords" if self._coords_kind is not None else "image"
+        self._image_target_shape: Optional[tuple[int, int, int]] = (
+            policy_status.image_shape if self._preprocess_raw_camera else None
+        )
         self.target_dt = 1.0 / float(self.cfg.loop.rate_hz)
         self.arm_connected = False
 
@@ -177,7 +213,7 @@ class InferLoopRunner:
                 return snap
             snap.color_preview = color
 
-            pusher_world, arm_status = self._read_arm_cached()
+            pusher_world, arm_status = self._read_arm_sync()
             if arm_status:
                 snap.status = arm_status
 
@@ -193,17 +229,39 @@ class InferLoopRunner:
             if not run_policy or not obs.available or arm_status:
                 return snap
 
-            wire_image = color if self._send_raw_camera_frame else obs.image
-            self._obs_hist.append({"image": wire_image, "agent_pos": obs.agent_pos})
+            if self._coords_kind == "tbar_coords":
+                wire_obs = pad_tbar_coords_frame(
+                    obs.tblock_coords, self._coord_slot_count
+                )
+            elif self._coords_kind == "tag_keypoints":
+                # Perception always emits a fixed (S, 2) tag_keypoints array;
+                # we just defend against an S mismatch (different ckpt vs the
+                # one the perception was configured for).
+                if obs.tag_keypoints.shape != (self._coord_slot_count, 2):
+                    raise RuntimeError(
+                        f"tag_keypoints shape {obs.tag_keypoints.shape} != "
+                        f"expected ({self._coord_slot_count}, 2). The ckpt "
+                        f"and the perception's static model disagree.")
+                wire_obs = obs.tag_keypoints.astype(np.float32)
+            elif self._preprocess_raw_camera:
+                wire_obs = self._preprocess_camera_frame(color)
+            else:
+                wire_obs = obs.image
+            self._obs_hist.append({self._wire_obs_key: wire_obs, "agent_pos": obs.agent_pos})
             if len(self._obs_hist) < self.n_obs_steps:
                 snap.status = f"warmup ({len(self._obs_hist)}/{self.n_obs_steps})"
                 self._step_count += 1
                 return snap
 
-            image_window = np.stack([w["image"] for w in self._obs_hist], axis=0)
+            obs_window = np.stack([w[self._wire_obs_key] for w in self._obs_hist], axis=0)
             agent_window = np.stack([w["agent_pos"] for w in self._obs_hist], axis=0)
             try:
-                result = self.policy.predict(image_window, agent_window)
+                if self._coords_kind is not None:
+                    result = self.policy.predict(
+                        agent_pos_window=agent_window, coords_window=obs_window
+                    )
+                else:
+                    result = self.policy.predict(obs_window, agent_window)
             except Exception as exc:
                 snap.status = f"policy service error: {type(exc).__name__}: {exc}"
                 return snap
@@ -245,7 +303,7 @@ class InferLoopRunner:
                 # Per-waypoint refresh is gone deliberately — it gated the
                 # next /robot/step on perception, which made motion chunky.
                 if on_executing is not None:
-                    fresh_world, _ = self._read_arm_cached()
+                    fresh_world, _ = self._read_arm_sync()
                     fresh_color = self._capture_color(snap)
                     if fresh_color is not None:
                         snap.color_preview = fresh_color
@@ -290,13 +348,60 @@ class InferLoopRunner:
             snap.status = f"camera get_frames failed: {type(exc).__name__}: {exc}"
             return None
 
-    def _read_arm_cached(self) -> tuple[np.ndarray, str]:
-        """Return (pusher_world, status_msg). status_msg is '' on success."""
-        if self.arm_reader is None:
+    def _preprocess_camera_frame(self, color: np.ndarray) -> np.ndarray:
+        """Client-side mirror of policy_runner._preprocess_raw_image_window.
+
+        Applies gray -> center-crop square -> resize -> repeat to 3 channels,
+        scaled to float32 [0, 1], returning (3, H_t, W_t). Doing this here
+        keeps the JSON payload small (a 2048x2448 RGB frame is ~30x larger on
+        the wire than the final 96x96 tensor and dominates /predict latency).
+        """
+        assert self._image_target_shape is not None
+        C_t, H_t, W_t = self._image_target_shape
+        if C_t != 3 or H_t != W_t:
+            raise ValueError(
+                f"client-side preprocess assumes 3-channel square target, "
+                f"got image_shape={self._image_target_shape}"
+            )
+        if color.ndim == 3 and color.shape[-1] == 3:
+            gray = cv2.cvtColor(color, cv2.COLOR_RGB2GRAY)
+        elif color.ndim == 2:
+            gray = color
+        else:
+            raise ValueError(
+                f"camera frame must be (H,W) or (H,W,3) uint8, got {color.shape}"
+            )
+        H, W = gray.shape
+        side = min(H, W)
+        top = (H - side) // 2
+        left = (W - side) // 2
+        cropped = gray[top:top + side, left:left + side]
+        resized = cv2.resize(cropped, (W_t, H_t), interpolation=cv2.INTER_AREA)
+        rgb = np.repeat(resized[..., None], 3, axis=-1)
+        return np.moveaxis(rgb, -1, 0).astype(np.float32) / 255.0
+
+    def _read_arm_sync(self) -> tuple[np.ndarray, str]:
+        """Read arm pose via fresh HTTP (no cache); returns (pusher_world, status).
+
+        Bypasses ArmReader's ~30Hz poll cache so the agent_pose handed to the
+        policy reflects the arm's state *at the moment policy obs is built*,
+        not whatever the background poller last saw (up to 1/poll_hz =
+        ~33ms ago). Costs one ``/robot/state`` HTTP RTT (~10-50ms) per
+        tick, which is acceptable at the loop's 10Hz cadence.
+
+        ``ArmReader`` is still kept alive for the GUI's live-pose readout
+        (eval_app polls it without blocking); only the policy obs path
+        switches to sync.
+        """
+        if self.arm is None:
             return np.zeros(3, dtype=np.float64), "arm disabled (--no-arm)"
-        reading, _ts, last_err = self.arm_reader.get_reading()
-        if reading is None:
-            return np.zeros(3, dtype=np.float64), f"arm reader: {last_err or 'no reading yet'}"
+        try:
+            reading = self.arm.read()
+        except Exception as exc:
+            return (
+                np.zeros(3, dtype=np.float64),
+                f"arm read: {type(exc).__name__}: {exc}",
+            )
         return reading.pusher_world, ""
 
     def _fill_snap_from_obs(
@@ -412,6 +517,10 @@ def build_subsystems(
         apriltag_refine_edges=bool(cfg.apriltag.refine_edges),
         apriltag_decode_sharpening=float(cfg.apriltag.decode_sharpening),
         enable_kalman=bool(cfg.apriltag.enable_kalman),
+        # tag_keypoints ckpts ship their training tag-subset; restricting the
+        # extractor to that subset keeps the obs slot count aligned with the
+        # trained policy.
+        object_tag_ids=policy_status.tag_ids,
     )
 
     if no_arm:

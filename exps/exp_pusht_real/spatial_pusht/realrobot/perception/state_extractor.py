@@ -17,6 +17,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Optional
 
 import cv2
 import numpy as np
@@ -37,8 +38,18 @@ from exps.exp_pusht_real.spatial_pusht.data.occupancy_utils import rasterize_occ
 class SpatialObservation:
     """One inference-ready observation packaged with diagnostics."""
 
-    image: np.ndarray            # (1, H, W) float32 in {0, 1}
+    image: np.ndarray            # (1, H, W) float32 in {0, 0.5, 1}
     agent_pos: np.ndarray        # (2,) float32 voxel coords [x, y]
+    # Sparse T-bar voxel outline, (k, 2) int32 [x, y] sorted by (x, y). Mirrors
+    # the `tblock_coords` JSON field used at training time by the tbar-coords
+    # policy variant. Empty (k=0) for unavailable / failed frames.
+    tblock_coords: np.ndarray
+    # Fixed-slot AprilTag corner voxel xy, (S, 2) int32. One slot per
+    # (tag_id, corner_idx) in the same ordering the recording used at
+    # training time. Always shape (S, 2) — even when the object pose is
+    # unavailable we re-project the last-known canonical layout (or zeros
+    # at startup) so the policy sees a stable shape.
+    tag_keypoints: np.ndarray
     available: bool
     status: str
     tblock_pose_world: dict | None  # {translation_m: (3,), wxyz: (4,)} or None
@@ -68,6 +79,7 @@ class SpatialStateExtractor:
         apriltag_refine_edges: bool = True,
         apriltag_decode_sharpening: float = 0.25,
         enable_kalman: bool = True,
+        object_tag_ids: Optional[list[int]] = None,
     ):
         self.static_model: AprilTagStaticReconstructionModel = (
             load_static_reconstruction_model(model_dir)
@@ -99,6 +111,59 @@ class SpatialStateExtractor:
         self._enable_kalman = bool(enable_kalman)
         self._pose_smoother = AprilTagPoseKalmanSmoother() if enable_kalman else None
         self._vertex_smoother = MeshVertexKalmanSmoother() if enable_kalman else None
+
+        # Pre-bake the canonical (T1-aligned, object-frame) corners of every
+        # object tag, in the (tag_id, corner_idx) ordering the recording used
+        # at training time (sorted ascending). Per frame we'll apply the
+        # current `T_world_from_object` to these to get the live world xyz of
+        # each slot, then project to voxel xy — mirroring the JSON field
+        # `tblock_apriltag_points_world[i].coord_xy` shipped by the recording.
+        #
+        # `object_tag_ids` restricts the slot set to the tags that were
+        # actually present at training time. Without this filter we'd default
+        # to all calibrated object tags in the static model, which on this
+        # rig is 9 tags = 36 slots, while the dataset only logged 3 tags = 12
+        # slots — so the obs shape would mismatch the trained policy.
+        configured_object_ids = tuple(
+            int(t) for t in self.static_model.object_tag_ids
+        )
+        if object_tag_ids is None:
+            allowed_ids = configured_object_ids
+        else:
+            allowed_ids = tuple(int(t) for t in object_tag_ids)
+            unknown = [t for t in allowed_ids if t not in configured_object_ids]
+            if unknown:
+                raise ValueError(
+                    f"object_tag_ids={list(allowed_ids)} contains tag(s) "
+                    f"{unknown} not present in static model "
+                    f"{configured_object_ids}"
+                )
+        self.tag_slot_keys: tuple[tuple[int, int], ...] = tuple(
+            sorted(
+                (int(tag_id), int(corner_idx))
+                for tag_id in allowed_ids
+                for corner_idx in range(
+                    self.static_model.corner_points_by_tag[int(tag_id)].shape[0]
+                )
+            )
+        )
+        if self.tag_slot_keys:
+            canonical = np.stack([
+                self.static_model.corner_points_by_tag[tag_id][corner_idx]
+                for tag_id, corner_idx in self.tag_slot_keys
+            ]).astype(np.float64)             # (S, 3) in canonical object frame
+        else:
+            canonical = np.zeros((0, 3), dtype=np.float64)
+        self._tag_canonical_world = canonical
+        # Voxel-grid metadata for the projection step.
+        extent = self.bbox_max - self.bbox_min
+        self._voxel_size_xyz = extent / np.maximum(
+            self.resolution_xyz.astype(np.float64), 1.0
+        )
+        # Forward-fill seed: zeros until the first frame produces a valid pose.
+        self._last_tag_keypoints: np.ndarray = np.zeros(
+            (len(self.tag_slot_keys), 2), dtype=np.int32
+        )
 
     # ------------------------------------------------------------------
     # Main per-frame call
@@ -153,12 +218,11 @@ class SpatialStateExtractor:
                 timestamp_s=float(timestamp_s),
                 reproj_error_px=float(recon.object_reproj_error_px),
             )
-            tblock_translation = t_world_from_object.translation
-            tblock_rotation = t_world_from_object.rotation
         else:
+            t_world_from_object = recon.T_world_from_object
             mesh_world = recon.mesh_vertices_world
-            tblock_translation = recon.T_world_from_object.translation
-            tblock_rotation = recon.T_world_from_object.rotation
+        tblock_translation = t_world_from_object.translation
+        tblock_rotation = t_world_from_object.rotation
 
         sl = compute_spatial_language(
             mesh_vertices_world=mesh_world,
@@ -169,12 +233,24 @@ class SpatialStateExtractor:
             resolution_xyz=self.resolution_xyz,
         )
 
+        # Reproject the canonical tag corners into the current world frame
+        # using `T_world_from_object`, then voxelise. Done once regardless of
+        # the sl.available outcome so the tag-keypoint policy still gets a
+        # plausible per-frame slot layout (or the forward-filled last-known
+        # one when the pose is missing).
+        tag_keypoints_now = self._project_tag_keypoints(t_world_from_object)
+        if tag_keypoints_now is not None:
+            self._last_tag_keypoints = tag_keypoints_now
+        tag_keypoints_obs = self._last_tag_keypoints.copy()
+
         if not sl.available:
             # Even when the T-block can't be located we still ship the static
             # goal layer so the model sees a familiar baseline observation.
             return SpatialObservation(
                 image=self.goal_grid.copy()[None],
                 agent_pos=np.zeros(2, dtype=np.float32),
+                tblock_coords=_empty_tblock_coords(),
+                tag_keypoints=tag_keypoints_obs,
                 available=False,
                 status=sl.status,
                 tblock_pose_world=self._serialize_pose(tblock_translation, tblock_rotation),
@@ -195,6 +271,10 @@ class SpatialStateExtractor:
         return SpatialObservation(
             image=grid[None],
             agent_pos=agent_pos,
+            # Sparse outline matches the JSON `tblock_coords` field used by
+            # the tbar-coords policy variant at training time.
+            tblock_coords=_sorted_xy(sl.tblock_voxels_2d),
+            tag_keypoints=tag_keypoints_obs,
             available=True,
             status=sl.status,
             tblock_pose_world=self._serialize_pose(tblock_translation, tblock_rotation),
@@ -239,6 +319,8 @@ class SpatialStateExtractor:
         return SpatialObservation(
             image=self.goal_grid.copy()[None],
             agent_pos=np.zeros(2, dtype=np.float32),
+            tblock_coords=_empty_tblock_coords(),
+            tag_keypoints=self._last_tag_keypoints.copy(),
             available=False,
             status=status,
             tblock_pose_world=None,
@@ -247,3 +329,34 @@ class SpatialStateExtractor:
             visible_background_tags=tuple(),
             visible_object_tags=tuple(),
         )
+
+    def _project_tag_keypoints(self, t_world_from_object) -> Optional[np.ndarray]:
+        """Apply the current `T_world_from_object` to the canonical tag corners
+        and voxelise the xy of each. Returns (S, 2) int32 or None if no slots
+        are configured / pose is missing."""
+        if self._tag_canonical_world.shape[0] == 0 or t_world_from_object is None:
+            return None
+        world_pts = t_world_from_object.apply_points(self._tag_canonical_world)
+        xy = world_pts[:, :2]
+        voxel = np.floor(
+            (xy - self.bbox_min[:2]) / self._voxel_size_xyz[:2]
+        ).astype(np.int32)
+        max_xy = self.resolution_xyz[:2].astype(np.int32) - 1
+        np.clip(voxel, 0, max_xy, out=voxel)
+        return voxel
+
+
+def _empty_tblock_coords() -> np.ndarray:
+    return np.zeros((0, 2), dtype=np.int32)
+
+
+def _sorted_xy(coords) -> np.ndarray:
+    """Match the training-time convention in episode_parser.parse_episode:
+    cast to int, sort by (x, y) so the downstream MLP/UNet sees a stable
+    ordering regardless of perception's iteration order."""
+    arr = np.asarray(coords, dtype=np.int32)
+    if arr.ndim != 2 or arr.shape[0] == 0:
+        return _empty_tblock_coords()
+    arr = arr[:, :2]
+    order = np.lexsort((arr[:, 1], arr[:, 0]))
+    return arr[order]

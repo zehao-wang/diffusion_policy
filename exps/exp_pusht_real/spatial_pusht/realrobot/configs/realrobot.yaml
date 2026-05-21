@@ -13,7 +13,7 @@ bbox_max: [ 0.45,  0.45, 0.1]
 resolution_xyz: [128, 128, 12]
 # z slice the 2D model commits to when decoding voxel actions back to 3D.
 # Episode JSONs use `move.target_coord[2] = 3`.
-action_z_voxel: 3
+action_z_voxel: 2 # default 3
 
 paths:
   # Static AprilTag reconstruction model dir. Contains
@@ -69,11 +69,8 @@ pusht_service:
   url: http://localhost:8012
   channel: can0
   interface: socketcan
-  speed: 20 # 5
-  # Bumped from 3 -> 6: /robot/step_chunk streams every planned config without
-  # stopping between waypoints, so denser per-segment sampling now translates
-  # directly into smoother motion across segment seams.
-  timesteps: 6 # 15
+  speed: 10 
+  timesteps: 15 
   dt: 0.05
   poll_hz: 30.0   # background ArmReader polling rate
 

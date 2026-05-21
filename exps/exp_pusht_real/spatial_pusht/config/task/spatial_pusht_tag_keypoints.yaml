@@ -1,0 +1,30 @@
+name: spatial_pusht_tag_keypoints
+
+# obs = [tag_keypoints.flatten() (S*2) || agent_pos (2)]
+# `tag_ids` lists which physical AprilTags appear on the manipulated object,
+# in ascending order. Each tag contributes 4 corners, so S = 4 * len(tag_ids).
+# This MUST match the tag subset detected at recording time -- the build log
+# prints the slot ordering and any mismatch will raise. The inference
+# extractor reads this same list from the ckpt to restrict its `tag_slot_keys`
+# (otherwise it would default to all `static_model.object_tag_ids`, which may
+# include calibrated-but-unused tags).
+tag_ids: [48, 49, 73]
+n_tag_keypoints: ${eval:'4*len(${task.tag_ids})'}
+obs_dim: ${eval:'${task.n_tag_keypoints}*2 + 2'}
+action_dim: 2
+keypoint_dim: ${eval:'${task.n_tag_keypoints}*2'}
+zarr_path: exps/exp_pusht_real/spatial_pusht/data/spatial_pusht.zarr
+
+env_runner:
+  _target_: exps.exp_pusht_real.spatial_pusht.data.noop_runner.RealPushTLowdimRunner
+
+dataset:
+  _target_: exps.exp_pusht_real.spatial_pusht.data.occupancy_dataset.SpatialPushTTagKeypointsDataset
+  zarr_path: ${task.zarr_path}
+  horizon: ${horizon}
+  pad_before: ${eval:'${n_obs_steps}-1+${n_latency_steps}'}
+  pad_after: ${eval:'${n_action_steps}-1'}
+  seed: 42
+  val_ratio: 0.05
+  max_train_episodes: null
+  stride: 1

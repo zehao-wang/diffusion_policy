@@ -1,4 +1,4 @@
-"""Sanity-check that both dataset variants emit correctly-shaped batches.
+"""Sanity-check that all dataset variants emit correctly-shaped batches.
 
 Usage (from repo root):
     python -m exps.exp_pusht_real.spatial_pusht.scripts.test_dataset \
@@ -18,6 +18,8 @@ from torch.utils.data import DataLoader
 from exps.exp_pusht_real.spatial_pusht.data import (
     SpatialPushTOccupancyFlatDataset,
     SpatialPushTOccupancyImageDataset,
+    SpatialPushTTBarCoordsDataset,
+    SpatialPushTTagKeypointsDataset,
 )
 
 
@@ -65,6 +67,8 @@ def main():
     for name, cls in [
         ("variant A: occupancy image", SpatialPushTOccupancyImageDataset),
         ("variant B: occupancy flat", SpatialPushTOccupancyFlatDataset),
+        ("variant C: tbar coords lowdim", SpatialPushTTBarCoordsDataset),
+        ("variant D: tag keypoints lowdim", SpatialPushTTagKeypointsDataset),
     ]:
         ds = cls(zarr_path=str(args.zarr), horizon=args.horizon,
                  pad_before=1, pad_after=7, val_ratio=0.05)

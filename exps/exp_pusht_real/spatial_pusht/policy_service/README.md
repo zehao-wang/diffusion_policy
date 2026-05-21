@@ -32,7 +32,7 @@ On startup the service loads the checkpoint, prefers the EMA model when
 |--------|----------|------|---------|
 | GET    | /health  | —    | `{"status":"ok","ready":bool}` |
 | GET    | /status  | —    | `{"status":"ok","ready":true,"policy":{ckpt_path, device, n_obs_steps, n_action_steps, image_shape, agent_pos_dim, action_dim}}` |
-| POST   | /predict | `{"image": <(T,C,H,W) list>, "agent_pos": <(T,agent_pos_dim) list>}` | `{"action": <(n_action_steps,action_dim) list>, "took_ms": float}` |
+| POST   | /predict | `{"agent_pos": <(T,agent_pos_dim) list>,` plus **one of** `"image": <(T,C,H,W) list>` (image/lowdim ckpts) or `"coords": <(T,K,2) list>` (tbar_coords ckpts; pre-pad/sub-sample to K = `status.tbar_pad_n`) | `{"action": <(n_action_steps,action_dim) list>, "took_ms": float}` |
 | POST   | /reset   | `{}` | `{"status":"ok"}` (no-op; diffusion policy is stateless) |
 
 Errors return HTTP 4xx with `{"error": "..."}` for bad input, 503 before
@@ -81,7 +81,7 @@ result = client.predict(image_window, agent_pos_window)
   channel at 128×128 plus a 2-D pose, T=2), a single request encodes to
   ~2 MB of text. At 10 Hz this is well within the loopback bandwidth.
   Switch to msgpack if you ever move the service across the network.
-* On startup the runner reads `cfg.task.shape_meta` to discover expected
-  shapes. Checkpoints from `spatial_pusht_flat` (single concatenated
-  `obs` vector) are **not** served correctly — use the image-flavoured
-  workspace.
+* On startup the runner picks a policy kind from `cfg.task`:
+  `shape_meta` → `image`, `tbar_pad_n` → `tbar_coords`, otherwise
+  `obs_dim`/`action_dim` → `lowdim`. `status.policy_kind` tells the client
+  which wire field to send (`image` vs `coords`).

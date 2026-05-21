@@ -95,21 +95,35 @@ class _PolicyHandler(BaseHTTPRequestHandler):
             self._respond(503, {"error": "Policy not loaded yet"})
             return
 
-        image = body.get("image")
         agent_pos = body.get("agent_pos")
-        if image is None or agent_pos is None:
-            raise ValueError("Body must contain 'image' and 'agent_pos'")
+        image = body.get("image")
+        coords = body.get("coords")
+        if agent_pos is None or (image is None and coords is None):
+            raise ValueError(
+                "Body must contain 'agent_pos' plus one of 'image' / 'coords'"
+            )
+        if image is not None and coords is not None:
+            raise ValueError("Body must contain only one of 'image' / 'coords'")
 
-        # Preserve int dtype so the runner can detect raw uint8 camera frames
-        # (they get preprocessed server-side); pre-processed floats stay float.
-        image_arr = np.asarray(image)
-        if image_arr.dtype.kind in ("i", "u"):
-            image_arr = image_arr.astype(np.uint8)
-        else:
-            image_arr = image_arr.astype(np.float32)
         agent_pos_arr = np.asarray(agent_pos, dtype=np.float32)
-
-        result = _RUNNER.predict(image_arr, agent_pos_arr)
+        if coords is not None:
+            coords_arr = np.asarray(coords, dtype=np.float32)
+            result = _RUNNER.predict(
+                agent_pos_window=agent_pos_arr,
+                coords_window=coords_arr,
+            )
+        else:
+            # Preserve int dtype so the runner can detect raw uint8 camera frames
+            # (preprocessed server-side); pre-processed floats stay float.
+            image_arr = np.asarray(image)
+            if image_arr.dtype.kind in ("i", "u"):
+                image_arr = image_arr.astype(np.uint8)
+            else:
+                image_arr = image_arr.astype(np.float32)
+            result = _RUNNER.predict(
+                image_window=image_arr,
+                agent_pos_window=agent_pos_arr,
+            )
         self._respond(
             200,
             {
@@ -150,6 +164,20 @@ def serve(
     httpd.daemon_threads = True
     print(f"[policy-service] listening on http://{host}:{port}")
     print(f"[policy-service] ckpt={runner.info.ckpt_path}")
+    extra = ""
+    if runner.info.policy_kind == "lowdim":
+        extra = f" obs_dim={runner.info.obs_dim} keypoint_dim={runner.info.keypoint_dim}"
+    elif runner.info.policy_kind == "tbar_coords":
+        extra = (
+            f" obs_dim={runner.info.obs_dim} keypoint_dim={runner.info.keypoint_dim} "
+            f"tbar_pad_n={runner.info.tbar_pad_n}"
+        )
+    elif runner.info.policy_kind == "tag_keypoints":
+        extra = (
+            f" obs_dim={runner.info.obs_dim} keypoint_dim={runner.info.keypoint_dim} "
+            f"n_tag_keypoints={runner.info.n_tag_keypoints} "
+            f"tag_ids={runner.info.tag_ids}"
+        )
     print(
         f"[policy-service] policy_kind={runner.info.policy_kind} "
         f"n_obs_steps={runner.info.n_obs_steps} "
@@ -157,11 +185,7 @@ def serve(
         f"image_shape={runner.info.image_shape} "
         f"agent_pos_dim={runner.info.agent_pos_dim} "
         f"action_dim={runner.info.action_dim}"
-        + (
-            f" obs_dim={runner.info.obs_dim} keypoint_dim={runner.info.keypoint_dim}"
-            if runner.info.policy_kind == "lowdim"
-            else ""
-        )
+        + extra
     )
     try:
         httpd.serve_forever()

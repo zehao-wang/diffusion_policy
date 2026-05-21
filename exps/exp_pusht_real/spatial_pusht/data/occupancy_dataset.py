@@ -1,4 +1,4 @@
-"""Two diffusion-policy datasets over the same occupancy zarr.
+"""Three diffusion-policy datasets over the same occupancy zarr.
 
 The split mirrors how the upstream repo separates `pusht_image` vs `pusht_lowdim`
 -- only the state representation changes; the rest of the training logic should
@@ -10,11 +10,19 @@ Variant A  (image, mirrors PushTImageDataset / pusht_image.yaml):
              action = (T, 2).
     Trained with the hybrid image workspace (CNN sub-encoder + low_dim concat).
 
-Variant B  (lowdim, mirrors PushTLowdimDataset / pusht_lowdim.yaml):
+Variant B  (flat lowdim, mirrors PushTLowdimDataset / pusht_lowdim.yaml):
     BaseLowdimDataset subclass.
     Returns: obs = (T, 128*128 + 2) [occupancy.flatten() || agent_pos],
              action = (T, 2).
     Trained with the lowdim workspace (raw obs vector -> U-Net global cond).
+
+Variant C  (T-bar coords lowdim, no occupancy raster):
+    BaseLowdimDataset subclass.
+    Returns: obs = (T, K*2 + 2) [tblock_coords.flatten() || agent_pos],
+             action = (T, 2).
+    Uses the dataset-wide-padded `tblock_coords` zarr field (sentinel = -1) so
+    every frame has a fixed K voxel slots. Trained with the same U-Net lowdim
+    workspace as variant B, but with a far smaller obs vector.
 """
 import copy
 from typing import Dict
@@ -52,10 +60,12 @@ class _SpatialReplayBufferLoader:
         val_ratio: float,
         max_train_episodes,
         stride: int = 1,
+        keys=("occupancy", "agent_pos", "action"),
     ):
         assert stride >= 1, f"stride must be >= 1, got {stride}"
+        self._zarr_keys = tuple(keys)
         self.replay_buffer = ReplayBuffer.copy_from_path(
-            zarr_path, keys=["occupancy", "agent_pos", "action"]
+            zarr_path, keys=list(keys)
         )
 
         val_mask = get_val_mask(
@@ -117,6 +127,24 @@ class _SpatialReplayBufferLoader:
     def get_all_actions(self) -> torch.Tensor:
         return torch.from_numpy(self.replay_buffer["action"][:])
 
+    def __getitem__(self, idx: int) -> Dict[str, torch.Tensor]:
+        # Every variant ultimately follows the same pipeline: pull a raw window
+        # from the sampler, stride-subsample it, and hand it off to a variant-
+        # specific `_sample_to_data`. Subclasses just implement that one method.
+        sample = self._stride_sample(self.sampler.sample_sequence(idx))
+        return dict_apply(self._sample_to_data(sample), torch.from_numpy)
+
+    def _fit_lowdim_normalizer(self, mode: str = "limits", **kwargs) -> LinearNormalizer:
+        """Fit one LinearNormalizer across the full (obs, action) the way
+        PushTLowdimDataset does. Lowdim variants delegate `get_normalizer` here;
+        image variants override `get_normalizer` directly."""
+        all_data = self._sample_to_data({
+            k: self.replay_buffer[k][:] for k in self._zarr_keys
+        })
+        normalizer = LinearNormalizer()
+        normalizer.fit(data=all_data, last_n_dims=1, mode=mode, **kwargs)
+        return normalizer
+
 
 # --------------------------------------------------------------------------- #
 #                Variant A: occupancy as a single-channel image               #
@@ -147,6 +175,16 @@ class SpatialPushTOccupancyImageDataset(_SpatialReplayBufferLoader, BaseImageDat
                              seed, val_ratio, max_train_episodes,
                              stride=stride)
 
+    def _sample_to_data(self, sample):
+        occ = sample["occupancy"].astype(np.float32)[:, None, :, :]  # (T, 1, H, W)
+        return {
+            "obs": {
+                "image": occ,
+                "agent_pos": sample["agent_pos"].astype(np.float32),
+            },
+            "action": sample["action"].astype(np.float32),
+        }
+
     def get_normalizer(self, mode: str = "limits", **kwargs) -> LinearNormalizer:
         # Mirrors PushTImageDataset.get_normalizer: low_dim keys + identity for image.
         data = {
@@ -157,18 +195,6 @@ class SpatialPushTOccupancyImageDataset(_SpatialReplayBufferLoader, BaseImageDat
         normalizer.fit(data=data, last_n_dims=1, mode=mode, **kwargs)
         normalizer["image"] = get_image_range_normalizer()
         return normalizer
-
-    def __getitem__(self, idx: int) -> Dict[str, torch.Tensor]:
-        sample = self._stride_sample(self.sampler.sample_sequence(idx))
-        occ = sample["occupancy"].astype(np.float32)[:, None, :, :]  # (T, 1, H, W)
-        data = {
-            "obs": {
-                "image": occ,
-                "agent_pos": sample["agent_pos"].astype(np.float32),
-            },
-            "action": sample["action"].astype(np.float32),
-        }
-        return dict_apply(data, torch.from_numpy)
 
 
 # --------------------------------------------------------------------------- #
@@ -227,21 +253,107 @@ class SpatialPushTOccupancyFlatDataset(_SpatialReplayBufferLoader, BaseLowdimDat
             "action": sample["action"].astype(np.float32),
         }
 
-    def get_normalizer(self, mode: str = "limits", **kwargs) -> LinearNormalizer:
-        # Mirrors PushTLowdimDataset: fit a single LinearNormalizer over the
-        # entire dataset's (obs, action). For the binary occupancy slice we'll
-        # get min=0/max=1 columns -> identity scaling; agent_pos columns get
-        # scaled to [-1, 1] like in pusht_lowdim.
-        all_data = self._sample_to_data({
-            "occupancy": self.replay_buffer["occupancy"][:],
-            "agent_pos": self.replay_buffer["agent_pos"][:],
-            "action": self.replay_buffer["action"][:],
-        })
-        normalizer = LinearNormalizer()
-        normalizer.fit(data=all_data, last_n_dims=1, mode=mode, **kwargs)
-        return normalizer
+    # Mirrors PushTLowdimDataset: one LinearNormalizer over the full (obs, action).
+    # Binary occupancy columns get min=0/max=1 -> identity scaling; agent_pos and
+    # action get scaled to [-1, 1] like upstream pusht_lowdim.
+    get_normalizer = _SpatialReplayBufferLoader._fit_lowdim_normalizer
 
-    def __getitem__(self, idx: int) -> Dict[str, torch.Tensor]:
-        sample = self._stride_sample(self.sampler.sample_sequence(idx))
-        data = self._sample_to_data(sample)
-        return dict_apply(data, torch.from_numpy)
+
+# --------------------------------------------------------------------------- #
+#       Variant C: padded T-bar voxel coords + agent_pos as one obs vec       #
+# --------------------------------------------------------------------------- #
+class SpatialPushTTBarCoordsDataset(_SpatialReplayBufferLoader, BaseLowdimDataset):
+    """Lowdim policy variant whose state is the T-bar voxel set itself.
+
+    The builder pads every frame's T-block voxel coords to a fixed K (the
+    dataset-wide observed max), with sentinel -1 for empty slots. We flatten
+    that and concatenate the pusher position to form a small dense obs vector,
+    skipping the rasterized occupancy entirely.
+
+    obs    = (T, K*2 + 2)   # [tblock_coords.flatten() || agent_pos]
+    action = (T, 2)
+    """
+
+    def __init__(
+        self,
+        zarr_path: str,
+        horizon: int = 1,
+        pad_before: int = 0,
+        pad_after: int = 0,
+        seed: int = 42,
+        val_ratio: float = 0.0,
+        max_train_episodes=None,
+        stride: int = 1,
+    ):
+        super().__init__()
+        self._init_from_zarr(zarr_path, horizon, pad_before, pad_after,
+                             seed, val_ratio, max_train_episodes,
+                             stride=stride,
+                             keys=("tblock_coords", "agent_pos", "action"))
+        self.tbar_pad_n = int(self.replay_buffer["tblock_coords"].shape[1])
+
+    def _sample_to_data(self, sample):
+        coords = sample["tblock_coords"].astype(np.float32)  # (T, K, 2)
+        T_ = coords.shape[0]
+        obs = np.concatenate([
+            coords.reshape(T_, -1),                       # (T, K*2)
+            sample["agent_pos"].astype(np.float32),       # (T, 2)
+        ], axis=-1)
+        return {
+            "obs": obs,
+            "action": sample["action"].astype(np.float32),
+        }
+
+    # Same pattern as variant B. The -1 sentinel sits just outside [0, grid-1],
+    # so under "limits" mode it lands exactly at the -1 end of the normalized
+    # range and stays distinguishable from real voxels.
+    get_normalizer = _SpatialReplayBufferLoader._fit_lowdim_normalizer
+
+
+# --------------------------------------------------------------------------- #
+#       Variant D: fixed-slot AprilTag keypoints + agent_pos as one obs       #
+# --------------------------------------------------------------------------- #
+class SpatialPushTTagKeypointsDataset(_SpatialReplayBufferLoader, BaseLowdimDataset):
+    """Lowdim policy variant whose state is the per-frame voxel xy of the
+    object-tag corners.
+
+    Mirrors the upstream `PushTLowdimDataset` 9-keypoint design exactly: every
+    frame ships the same fixed S keypoints (one per (tag_id, corner_idx) slot,
+    ordering set at build time), so the U-Net global-cond MLP sees a stable
+    layout — no padding, no sentinel.
+
+    obs    = (T, S*2 + 2)   # [tag_keypoints.flatten() || agent_pos]
+    action = (T, 2)
+    """
+
+    def __init__(
+        self,
+        zarr_path: str,
+        horizon: int = 1,
+        pad_before: int = 0,
+        pad_after: int = 0,
+        seed: int = 42,
+        val_ratio: float = 0.0,
+        max_train_episodes=None,
+        stride: int = 1,
+    ):
+        super().__init__()
+        self._init_from_zarr(zarr_path, horizon, pad_before, pad_after,
+                             seed, val_ratio, max_train_episodes,
+                             stride=stride,
+                             keys=("tag_keypoints", "agent_pos", "action"))
+        self.n_tag_keypoints = int(self.replay_buffer["tag_keypoints"].shape[1])
+
+    def _sample_to_data(self, sample):
+        kp = sample["tag_keypoints"].astype(np.float32)  # (T, S, 2)
+        T_ = kp.shape[0]
+        obs = np.concatenate([
+            kp.reshape(T_, -1),                          # (T, S*2)
+            sample["agent_pos"].astype(np.float32),      # (T, 2)
+        ], axis=-1)
+        return {
+            "obs": obs,
+            "action": sample["action"].astype(np.float32),
+        }
+
+    get_normalizer = _SpatialReplayBufferLoader._fit_lowdim_normalizer
